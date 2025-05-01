@@ -1,6 +1,6 @@
 // BlueBubbles + GHL Integration - Complete Implementation
 // This implementation properly handles both inbound and outbound messages
-// with explicit GHL conversation logging
+// with explicit GHL conversation logging and enhanced debugging
 
 require("dotenv").config();
 const express = require("express");
@@ -221,6 +221,119 @@ app.post("/ghl-webhook", async (req, res) => {
   }
 });
 
+// DEBUGGING ENDPOINT: Simple endpoint to test if server is receiving inbound messages
+app.post("/inbound-debug", (req, res) => {
+  // Log the received payload
+  console.log("============ INBOUND DEBUG ============");
+  console.log("Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("Query:", JSON.stringify(req.query, null, 2));
+  console.log("=======================================");
+  
+  // Always respond with success to confirm receipt
+  res.status(200).json({
+    status: "received",
+    timestamp: new Date().toISOString(),
+    headers: req.headers,
+    body: req.body,
+    query: req.query
+  });
+});
+
+// ENHANCED INBOUND ENDPOINT: For receiving messages from BlueBubbles and logging to GHL
+app.post("/inbound", async (req, res) => {
+  try {
+    console.log("Received inbound message from BlueBubbles - FULL PAYLOAD:", JSON.stringify(req.body));
+    
+    // Echo back payload for testing
+    if (req.query.echo === 'true') {
+      return res.status(200).json({ 
+        status: "echo", 
+        received: req.body, 
+        timestamp: new Date().toISOString() 
+      });
+    }
+    
+    // Validate the payload
+    if (!req.body || !req.body.data) {
+      console.error("Invalid payload structure received:", JSON.stringify(req.body));
+      return res.status(400).json({ error: "Invalid payload", received: req.body });
+    }
+    
+    const { data } = req.body;
+    
+    // More detailed validation
+    if (!data.text) {
+      console.error("Missing text field in data:", JSON.stringify(data));
+      return res.status(400).json({ error: "Missing message text", received: data });
+    }
+    
+    if (!data.handle || !data.handle.address) {
+      console.error("Missing or invalid handle/address:", JSON.stringify(data));
+      return res.status(400).json({ error: "Missing phone number", received: data });
+    }
+    
+    const message = data.text;
+    const phone = data.handle.address;
+    
+    console.log(`Inbound message from ${phone}: ${message.substring(0, 30)}${message.length > 30 ? '...' : ''}`);
+    
+    // Use configured location ID or fall back to default
+    const locationId = process.env.GHL_DEFAULT_LOCATION_ID || "lKWthVWigQO6xfZysNgf";
+    
+    // 1. Find or create the contact based on phone number
+    let contactId;
+    try {
+      contactId = await getContactIdByPhone(locationId, phone);
+      console.log(`Found/created contact ID: ${contactId}`);
+    } catch (err) {
+      console.error("Failed to find/create contact:", err.response?.data || err.message);
+      return res.status(500).json({ error: "Failed to process contact", details: err.message });
+    }
+    
+    // 2. Get or create a conversation for this contact
+    let conversationId;
+    try {
+      conversationId = await getOrCreateConversation(locationId, contactId);
+      console.log(`Found/created conversation ID: ${conversationId}`);
+    } catch (err) {
+      console.error("Failed to find/create conversation:", err.response?.data || err.message);
+      return res.status(500).json({ error: "Failed to process conversation", details: err.message });
+    }
+    
+    // 3. Log the inbound message to GHL
+    try {
+      console.log("About to log inbound message to GHL with:", { 
+        locationId, contactId, conversationId, messageLength: message.length
+      });
+      
+      const logResult = await logInboundMessageToGHL(locationId, contactId, conversationId, message);
+      console.log(`GHL inbound message logged successfully: ${logResult.status}`);
+      
+      // 4. Update conversation status with unread count for inbound messages
+      await updateInboundConversationStatus(locationId, conversationId);
+      console.log(`GHL conversation status updated`);
+      
+      res.status(200).json({ 
+        status: "success", 
+        message: "Inbound message logged to GHL",
+        details: {
+          contactId,
+          conversationId,
+          locationId
+        }
+      });
+    } catch (err) {
+      console.error("Failed to log inbound message to GHL:", 
+        err.response?.data ? JSON.stringify(err.response.data) : err.message);
+      return res.status(500).json({ error: "Failed to log message to GHL", details: err.message });
+    }
+  } catch (err) {
+    console.error("Inbound processing error:", err.message, err.stack);
+    res.status(500).json({ error: "Failed to process inbound message", details: err.message });
+  }
+});
+
 // OUTBOUND ENDPOINT: For GHL workflow webhooks sending messages via BlueBubbles
 app.post("/outbound", async (req, res) => {
   try {
@@ -319,69 +432,6 @@ app.post("/outbound", async (req, res) => {
       error: "Failed to process outbound message", 
       details: err.message 
     });
-  }
-});
-
-// INBOUND ENDPOINT: For receiving messages from BlueBubbles and logging to GHL
-app.post("/inbound", async (req, res) => {
-  try {
-    console.log("Received inbound message from BlueBubbles:", JSON.stringify(req.body));
-    
-    // Validate the payload
-    if (!req.body || !req.body.data) {
-      return res.status(400).json({ error: "Invalid payload" });
-    }
-    
-    const { data } = req.body;
-    const message = data.text;
-    const phone = data.handle.address;
-    
-    if (!message || !phone) {
-      return res.status(400).json({ error: "Missing message data" });
-    }
-    
-    console.log(`Inbound message from ${phone}: ${message.substring(0, 30)}${message.length > 30 ? '...' : ''}`);
-    
-    // Use configured location ID or fall back to default
-    const locationId = process.env.GHL_DEFAULT_LOCATION_ID || "lKWthVWigQO6xfZysNgf";
-    
-    // 1. Find or create the contact based on phone number
-    let contactId;
-    try {
-      contactId = await getContactIdByPhone(locationId, phone);
-      console.log(`Found/created contact ID: ${contactId}`);
-    } catch (err) {
-      console.error("Failed to find/create contact:", err.message);
-      return res.status(500).json({ error: "Failed to process contact", details: err.message });
-    }
-    
-    // 2. Get or create a conversation for this contact
-    let conversationId;
-    try {
-      conversationId = await getOrCreateConversation(locationId, contactId);
-      console.log(`Found/created conversation ID: ${conversationId}`);
-    } catch (err) {
-      console.error("Failed to find/create conversation:", err.message);
-      return res.status(500).json({ error: "Failed to process conversation", details: err.message });
-    }
-    
-    // 3. Log the inbound message to GHL
-    try {
-      const logResult = await logInboundMessageToGHL(locationId, contactId, conversationId, message);
-      console.log(`GHL inbound message logged successfully: ${logResult.status}`);
-      
-      // 4. Update conversation status with unread count for inbound messages
-      await updateInboundConversationStatus(locationId, conversationId);
-      console.log(`GHL conversation status updated`);
-      
-      res.status(200).json({ status: "success", message: "Inbound message logged to GHL" });
-    } catch (err) {
-      console.error("Failed to log inbound message to GHL:", err.response?.data || err.message);
-      return res.status(500).json({ error: "Failed to log message to GHL", details: err.message });
-    }
-  } catch (err) {
-    console.error("Inbound processing error:", err.message);
-    res.status(500).json({ error: "Failed to process inbound message", details: err.message });
   }
 });
 
@@ -874,7 +924,7 @@ async function refreshTokenIfNeeded(locationId) {
   }
 }
 
-// Simple test endpoint for sending messages
+// Test endpoint for webhook functionality
 app.get("/test", async (req, res) => {
   try {
     const phone = req.query.phone || "+15555555555";
@@ -929,6 +979,73 @@ app.get("/test", async (req, res) => {
   }
 });
 
+// Test endpoint for inbound webhook simulation
+app.get("/test-inbound", (req, res) => {
+  const phone = req.query.phone || "+15555555555";
+  const message = req.query.message || "Test inbound message from BlueBubbles";
+  
+  // Create sample BlueBubbles payload
+  const testPayload = {
+    data: {
+      text: message,
+      handle: {
+        address: phone
+      },
+      service: "iMessage",
+      dateCreated: new Date().toISOString(),
+      guid: "test-guid-" + Date.now()
+    }
+  };
+  
+  // Display instructions for testing
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Test Inbound Webhook</title>
+      <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        pre { background-color: #f8f9fa; padding: 15px; border-radius: 4px; overflow-x: auto; }
+        .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .button { display: inline-block; background-color: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
+      </style>
+    </head>
+    <body>
+      <h1>Test Inbound Webhook</h1>
+      
+      <div class="card">
+        <h2>Test Payload</h2>
+        <p>Use the following curl command to test your inbound webhook:</p>
+        <pre>curl -X POST "${process.env.APP_URL}/inbound" \
+  -H "Content-Type: application/json" \
+  -d '${JSON.stringify(testPayload, null, 2)}'</pre>
+      </div>
+      
+      <div class="card">
+        <h2>Test with echo mode</h2>
+        <p>To test with echo mode (returns the payload without processing):</p>
+        <pre>curl -X POST "${process.env.APP_URL}/inbound?echo=true" \
+  -H "Content-Type: application/json" \
+  -d '${JSON.stringify(testPayload, null, 2)}'</pre>
+      </div>
+      
+      <div class="card">
+        <h2>Test Debug Endpoint</h2>
+        <p>To test the debug endpoint:</p>
+        <pre>curl -X POST "${process.env.APP_URL}/inbound-debug" \
+  -H "Content-Type: application/json" \
+  -d '${JSON.stringify(testPayload, null, 2)}'</pre>
+      </div>
+      
+      <div class="card">
+        <h2>Payload JSON</h2>
+        <pre>${JSON.stringify(testPayload, null, 2)}</pre>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
 // Debug route
 app.get("/debug", (req, res) => {
   // Remove sensitive info
@@ -951,7 +1068,19 @@ app.get("/debug", (req, res) => {
     ghl_private_token_configured: !!process.env.GHL_PRIVATE_TOKEN,
     default_location_id: process.env.GHL_DEFAULT_LOCATION_ID || "Not configured",
     authorized_locations: Object.keys(sanitizedTokens).filter(k => sanitizedTokens[k].has_access_token).length,
-    tokens: sanitizedTokens
+    tokens: sanitizedTokens,
+    endpoints: {
+      inbound: `${process.env.APP_URL}/inbound`,
+      inbound_debug: `${process.env.APP_URL}/inbound-debug`,
+      outbound: `${process.env.APP_URL}/outbound`,
+      test: `${process.env.APP_URL}/test`,
+      test_inbound: `${process.env.APP_URL}/test-inbound`
+    },
+    environment: {
+      app_url: process.env.APP_URL,
+      node_env: process.env.NODE_ENV,
+      port: process.env.PORT || 10000
+    }
   });
 });
 
@@ -959,4 +1088,6 @@ app.get("/debug", (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`BlueBubbles + GHL Integration server running on port ${PORT}`);
+  console.log(`Inbound webhook URL: ${process.env.APP_URL}/inbound`);
+  console.log(`Debug webhook URL: ${process.env.APP_URL}/inbound-debug`);
 });
