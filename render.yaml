@@ -4,10 +4,11 @@ services:
     env: node
     plan: free
     buildCommand: npm install
-    startCommand: node index.js
+    startCommand: npm start
     envVars:
       - key: GHL_PRIVATE_TOKEN
         sync: false
       - key: BLUEBUBBLES_URL
         sync: false
-    healthCheckPath: /
+      - key: PORT
+        value: 10000
