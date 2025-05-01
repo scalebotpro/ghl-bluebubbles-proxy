@@ -1,49 +1,73 @@
-// Basic imports
+// GHL to BlueBubbles Integration - Production Ready
+require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
-require("dotenv").config();
 
 // Initialize Express
 const app = express();
 app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Basic route to confirm server is running
+// Basic logging middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// Health check route
 app.get("/", (req, res) => {
-  console.log("Health check hit");
   res.send("BlueBubbles <-> GHL Proxy Online");
 });
 
-// GHL to BlueBubbles route
+// OUTBOUND: GHL -> BlueBubbles (iMessage)
 app.post("/outbound", async (req, res) => {
   try {
     const { to, message } = req.body;
     
-    console.log(`Sending message to ${to}: ${message}`);
+    if (!to || !message) {
+      return res.status(400).json({ 
+        error: "Missing required fields", 
+        details: "Both 'to' and 'message' are required" 
+      });
+    }
     
+    console.log(`Sending message to ${to}: ${message.substring(0, 30)}${message.length > 30 ? '...' : ''}`);
+    
+    // Send to BlueBubbles (which sends via iMessage)
     await axios.post(process.env.BLUEBUBBLES_URL, {
       chatGuid: to,
       message,
       method: "apple-script"
     });
-
-    console.log("Message sent to BlueBubbles successfully");
+    
+    console.log("Message sent successfully");
     res.status(200).json({ status: "sent" });
   } catch (err) {
     console.error("BlueBubbles Error:", err.message);
-    res.status(500).json({ error: "BlueBubbles failed", details: err.message });
+    res.status(500).json({ error: "Failed to send message", details: err.message });
   }
 });
 
-// BlueBubbles to GHL route
+// INBOUND: BlueBubbles (iMessage) -> GHL
 app.post("/inbound", async (req, res) => {
   try {
+    // Validate the payload
+    if (!req.body || !req.body.data) {
+      return res.status(400).json({ error: "Invalid payload" });
+    }
+    
     const { data } = req.body;
     const message = data.text;
     const phone = data.handle.address;
     
-    console.log(`Received message from ${phone}: ${message}`);
-
+    if (!message || !phone) {
+      return res.status(400).json({ error: "Missing message data" });
+    }
+    
+    console.log(`Received message from ${phone}: ${message.substring(0, 30)}${message.length > 30 ? '...' : ''}`);
+    
+    // Forward to GHL Conversations API
     await axios.post(
       "https://services.leadconnectorhq.com/conversations/messages",
       {
@@ -60,25 +84,9 @@ app.post("/inbound", async (req, res) => {
         }
       }
     );
-
-    console.log("Message forwarded to GHL successfully");
+    
+    console.log("Message forwarded to GHL");
     res.status(200).json({ status: "logged" });
   } catch (err) {
     console.error("GHL Error:", err.message);
-    res.status(500).json({ error: "GHL logging failed", details: err.message });
-  }
-});
-
-// THIS IS THE CRITICAL PART FOR RENDER.COM
-const PORT = process.env.PORT || 3000;
-console.log(`Attempting to start server on port ${PORT}`);
-
-// First log that we're trying to start
-const server = app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
-
-// Add error handler to the server
-server.on('error', (error) => {
-  console.error('Server error:', error);
-});
+    res.status(500).j
