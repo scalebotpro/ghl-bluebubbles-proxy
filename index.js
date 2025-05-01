@@ -1,4 +1,4 @@
-// BlueBubbles + GHL Developer App Integration - Fixed Version
+// BlueBubbles + GHL Developer App Integration - Enhanced Version
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -12,6 +12,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // GHL API constants
 const GHL_API_URL = "https://services.leadconnectorhq.com";
+const GHL_API_VERSION = "2021-07-28";
 
 // Store tokens (in memory for demo, use a database in production)
 let tokens = {};
@@ -188,23 +189,26 @@ app.post("/ghl-webhook", async (req, res) => {
       // Forward outbound message to BlueBubbles
       const sendResult = await sendToBlueBubbles(phone, message);
       
-      // Log the message to GHL regardless of BlueBubbles success
-      // This ensures the conversation history is maintained even if BlueBubbles is down
-      if (contactId) {
+      // Log the message to GHL conversation
+      if (contactId && conversationId) {
         try {
+          // Use the proper endpoint for outbound messages
           await logOutboundMessageToGHL(locationId, contactId, conversationId, message);
           
           // Add a note to the conversation if BlueBubbles failed
           if (sendResult && !sendResult.success) {
             // Add a system note that delivery failed
             const noteMessage = `[System Note: Message delivery to BlueBubbles failed. Reason: ${sendResult.error}]`;
-            await logOutboundMessageToGHL(locationId, contactId, conversationId, noteMessage);
+            await logInternalNoteToGHL(locationId, contactId, conversationId, noteMessage);
           }
+          
+          // Update conversation status to ensure it's properly reflected in GHL
+          await updateConversationStatus(locationId, conversationId);
         } catch (logError) {
           console.error("Failed to log outbound message to GHL:", logError.message);
         }
       } else {
-        console.error("No contactId provided in webhook, cannot log outbound message");
+        console.error("No contactId or conversationId provided in webhook, cannot log outbound message");
       }
     }
     
@@ -221,24 +225,21 @@ async function logOutboundMessageToGHL(locationId, contactId, conversationId, me
     // Ensure we have a valid token
     await refreshTokenIfNeeded(locationId);
     
-    // Prepare the API request URL and payload
-    const url = `${GHL_API_URL}/conversations/messages/inbound`;
+    // Prepare the API request URL and payload - use the outbound endpoint
+    const url = `${GHL_API_URL}/conversations/messages/outbound`;
     const payload = {
       contactId,
+      conversationId,
       message,
       type: "SMS",
-      direction: "outbound"
+      direction: "outbound",
+      locationId
     };
-    
-    // Add conversationId if available
-    if (conversationId) {
-      payload.conversationId = conversationId;
-    }
     
     // Prepare headers
     const headers = {
       Authorization: `Bearer ${tokens[locationId]?.access_token || process.env.GHL_PRIVATE_TOKEN}`,
-      Version: "2021-07-28",
+      Version: GHL_API_VERSION,
       "Content-Type": "application/json",
       locationId
     };
@@ -260,6 +261,93 @@ async function logOutboundMessageToGHL(locationId, contactId, conversationId, me
   } catch (err) {
     console.error("GHL outbound logging error:", err.response?.data || err.message);
     throw err;
+  }
+}
+
+// Add internal notes to GHL conversation
+async function logInternalNoteToGHL(locationId, contactId, conversationId, message) {
+  try {
+    // Ensure we have a valid token
+    await refreshTokenIfNeeded(locationId);
+    
+    // Use the messages endpoint to create an internal note
+    const url = `${GHL_API_URL}/conversations/messages`;
+    const payload = {
+      contactId,
+      conversationId,
+      type: "SMS", // Using SMS as base type
+      messageType: "TYPE_INTERNAL_COMMENT", // This makes it an internal note
+      message,
+      locationId
+    };
+    
+    // Prepare headers
+    const headers = {
+      Authorization: `Bearer ${tokens[locationId]?.access_token || process.env.GHL_PRIVATE_TOKEN}`,
+      Version: GHL_API_VERSION,
+      "Content-Type": "application/json",
+      locationId
+    };
+    
+    // Log pre-API call
+    console.log(`[${new Date().toISOString()}] Adding internal note to GHL conversation`);
+    console.log(`URL: ${url}`);
+    console.log(`Headers: ${JSON.stringify({ ...headers, Authorization: "***MASKED***" })}`);
+    console.log(`Payload: ${JSON.stringify(payload)}`);
+    
+    // Make the API call
+    const response = await axios.post(url, payload, { headers });
+    
+    // Log post-API call
+    console.log(`[${new Date().toISOString()}] GHL internal note response: ${response.status}`);
+    console.log(`Response data: ${JSON.stringify(response.data)}`);
+    
+    return response;
+  } catch (err) {
+    console.error("GHL internal note error:", err.response?.data || err.message);
+    throw err;
+  }
+}
+
+// Update conversation status in GHL
+async function updateConversationStatus(locationId, conversationId) {
+  try {
+    // Ensure we have a valid token
+    await refreshTokenIfNeeded(locationId);
+    
+    // Use the conversation update endpoint
+    const url = `${GHL_API_URL}/conversations/${conversationId}`;
+    const payload = {
+      locationId,
+      // For outbound messages, make sure conversation appears in inbox
+      inbox: true
+    };
+    
+    // Prepare headers
+    const headers = {
+      Authorization: `Bearer ${tokens[locationId]?.access_token || process.env.GHL_PRIVATE_TOKEN}`,
+      Version: GHL_API_VERSION,
+      "Content-Type": "application/json",
+      locationId
+    };
+    
+    // Log pre-API call
+    console.log(`[${new Date().toISOString()}] Updating conversation status in GHL`);
+    console.log(`URL: ${url}`);
+    console.log(`Headers: ${JSON.stringify({ ...headers, Authorization: "***MASKED***" })}`);
+    console.log(`Payload: ${JSON.stringify(payload)}`);
+    
+    // Make the API call
+    const response = await axios.put(url, payload, { headers });
+    
+    // Log post-API call
+    console.log(`[${new Date().toISOString()}] GHL conversation update response: ${response.status}`);
+    console.log(`Response data: ${JSON.stringify(response.data)}`);
+    
+    return response;
+  } catch (err) {
+    console.error("GHL conversation update error:", err.response?.data || err.message);
+    // Don't throw error here to prevent cascading failures
   }
 }
 
@@ -301,7 +389,12 @@ app.post("/inbound", async (req, res) => {
     }
     
     // Forward to GHL Conversations API using OAuth token
-    await sendToGHL(locationId, phone, message);
+    const ghlResponse = await sendToGHL(locationId, phone, message);
+    
+    // Make sure conversation is updated properly
+    if (ghlResponse && ghlResponse.data && ghlResponse.data.conversationId) {
+      await updateConversationStatus(locationId, ghlResponse.data.conversationId);
+    }
     
     res.status(200).json({ status: "logged" });
   } catch (err) {
@@ -314,7 +407,7 @@ app.post("/inbound", async (req, res) => {
 app.post("/outbound", async (req, res) => {
   try {
     console.log("Received manual outbound request:", req.body);
-    let { to, message, contactId, locationId } = req.body;
+    let { to, message, contactId, locationId, conversationId } = req.body;
     
     if (!to || !message) {
       return res.status(400).json({
@@ -337,17 +430,30 @@ app.post("/outbound", async (req, res) => {
       }
     }
     
-    // Log to GHL if contactId is available
-    if (contactId && locationId) {
+    // If conversationId is not provided but we have contactId, try to find or create conversation
+    if (!conversationId && contactId && locationId) {
       try {
-        await logOutboundMessageToGHL(locationId, contactId, null, message);
+        conversationId = await getOrCreateConversation(locationId, contactId);
+        console.log(`Retrieved/created conversationId ${conversationId} for contactId ${contactId}`);
+      } catch (convErr) {
+        console.error("Failed to get/create conversation:", convErr.message);
+      }
+    }
+    
+    // Log to GHL if contactId is available
+    if (contactId && locationId && conversationId) {
+      try {
+        await logOutboundMessageToGHL(locationId, contactId, conversationId, message);
         
         // Add a note to the conversation if BlueBubbles failed
         if (sendResult && !sendResult.success) {
           // Add a system note that delivery failed
           const noteMessage = `[System Note: Message delivery to BlueBubbles failed. Reason: ${sendResult.error}]`;
-          await logOutboundMessageToGHL(locationId, contactId, null, noteMessage);
+          await logInternalNoteToGHL(locationId, contactId, conversationId, noteMessage);
         }
+        
+        // Update conversation status
+        await updateConversationStatus(locationId, conversationId);
       } catch (logError) {
         console.error("Failed to log outbound message to GHL:", logError.message);
       }
@@ -362,7 +468,11 @@ app.post("/outbound", async (req, res) => {
       });
     }
     
-    res.status(200).json({ status: "sent", ghl_logging: contactId ? "success" : "skipped" });
+    res.status(200).json({ 
+      status: "sent", 
+      ghl_logging: contactId ? "success" : "skipped",
+      conversationId: conversationId || null 
+    });
   } catch (err) {
     console.error("Manual outbound error:", err.message);
     res.status(500).json({ error: "Failed to send message", details: err.message });
@@ -401,7 +511,7 @@ async function sendToBlueBubbles(to, message) {
     );
     
     console.log("BlueBubbles response:", response.status);
-    return response;
+    return { success: true, response };
   } catch (err) {
     // Check if it's a timeout error
     if (err.code === 'ECONNABORTED' || (err.response && err.response.status === 524)) {
@@ -450,7 +560,7 @@ async function getContactIdByPhone(locationId, phone) {
     // Prepare headers
     const headers = {
       Authorization: `Bearer ${tokens[locationId]?.access_token || process.env.GHL_PRIVATE_TOKEN}`,
-      Version: "2021-07-28",
+      Version: GHL_API_VERSION,
       "Content-Type": "application/json"
     };
     
@@ -481,6 +591,104 @@ async function getContactIdByPhone(locationId, phone) {
   }
 }
 
+// Function to get or create a conversation for a contact
+async function getOrCreateConversation(locationId, contactId) {
+  try {
+    // First try to find an existing conversation for this contact
+    const conversation = await findConversationByContactId(locationId, contactId);
+    
+    if (conversation) {
+      return conversation.id;
+    }
+    
+    // If no conversation exists, create a new one
+    const url = `${GHL_API_URL}/conversations/`;
+    const payload = {
+      locationId,
+      contactId
+    };
+    
+    // Prepare headers
+    const headers = {
+      Authorization: `Bearer ${tokens[locationId]?.access_token || process.env.GHL_PRIVATE_TOKEN}`,
+      Version: GHL_API_VERSION,
+      "Content-Type": "application/json"
+    };
+    
+    // Log pre-API call
+    console.log(`[${new Date().toISOString()}] Creating new conversation in GHL`);
+    console.log(`URL: ${url}`);
+    console.log(`Headers: ${JSON.stringify({ ...headers, Authorization: "***MASKED***" })}`);
+    console.log(`Payload: ${JSON.stringify(payload)}`);
+    
+    // Make the API call
+    const response = await axios.post(url, payload, { headers });
+    
+    // Log post-API call
+    console.log(`[${new Date().toISOString()}] GHL conversation create response: ${response.status}`);
+    console.log(`Response data: ${JSON.stringify(response.data)}`);
+    
+    // Extract conversationId from response
+    const conversationId = response.data.conversation?.id;
+    
+    if (!conversationId) {
+      throw new Error("Conversation ID not found in GHL response");
+    }
+    
+    return conversationId;
+  } catch (err) {
+    console.error("GHL conversation get/create error:", err.response?.data || err.message);
+    throw err;
+  }
+}
+
+// Function to find a conversation by contact ID
+async function findConversationByContactId(locationId, contactId) {
+  try {
+    // Search for conversations by contact ID
+    const url = `${GHL_API_URL}/conversations/search`;
+    
+    // Prepare headers
+    const headers = {
+      Authorization: `Bearer ${tokens[locationId]?.access_token || process.env.GHL_PRIVATE_TOKEN}`,
+      Version: GHL_API_VERSION,
+      "Content-Type": "application/json"
+    };
+    
+    // Build query params
+    const params = {
+      locationId,
+      contactId,
+      limit: 1, // We only need one conversation
+      sortBy: "last_message_date", // Get the most recent conversation
+      sort: "desc"
+    };
+    
+    // Log pre-API call
+    console.log(`[${new Date().toISOString()}] Searching for conversation in GHL`);
+    console.log(`URL: ${url}`);
+    console.log(`Headers: ${JSON.stringify({ ...headers, Authorization: "***MASKED***" })}`);
+    console.log(`Params: ${JSON.stringify(params)}`);
+    
+    // Make the API call
+    const response = await axios.get(url, { headers, params });
+    
+    // Log post-API call
+    console.log(`[${new Date().toISOString()}] GHL conversation search response: ${response.status}`);
+    console.log(`Found ${response.data.conversations?.length || 0} conversations`);
+    
+    // Return the first conversation if any found
+    if (response.data.conversations && response.data.conversations.length > 0) {
+      return response.data.conversations[0];
+    }
+    
+    return null;
+  } catch (err) {
+    console.error("GHL conversation search error:", err.response?.data || err.message);
+    return null;
+  }
+}
+
 // Function to send message to GHL using OAuth
 async function sendToGHL(locationId, phone, message) {
   try {
@@ -490,10 +698,14 @@ async function sendToGHL(locationId, phone, message) {
     // First, look up or create the contact to get the contactId
     const contactId = await getContactIdByPhone(locationId, phone);
     
+    // Get or create a conversation for this contact
+    const conversationId = await getOrCreateConversation(locationId, contactId);
+    
     // Now prepare the message API request
     const url = `${GHL_API_URL}/conversations/messages/inbound`;
     const payload = {
-      contactId: contactId,  // This is critical - must use contactId, not just contact object
+      contactId: contactId,
+      conversationId: conversationId,
       message: message,
       type: "SMS",  // Use uppercase SMS as per GHL API requirements
       direction: "inbound"
@@ -502,7 +714,7 @@ async function sendToGHL(locationId, phone, message) {
     // Prepare headers
     const headers = {
       Authorization: `Bearer ${tokens[locationId].access_token}`,
-      Version: "2021-07-28",
+      Version: GHL_API_VERSION,
       "Content-Type": "application/json",
       locationId
     };
@@ -516,6 +728,9 @@ async function sendToGHL(locationId, phone, message) {
     // Make the API call
     const response = await axios.post(url, payload, { headers });
     
+    // Update the conversation to ensure it's properly reflected in GHL (unread count, inbox status)
+    await updateInboundConversationStatus(locationId, conversationId);
+    
     // Log post-API call
     console.log(`[${new Date().toISOString()}] GHL inbound message response: ${response.status}`);
     console.log(`Response data: ${JSON.stringify(response.data)}`);
@@ -524,6 +739,49 @@ async function sendToGHL(locationId, phone, message) {
   } catch (err) {
     console.error("GHL API error:", err.response?.data || err.message);
     throw err;
+  }
+}
+
+// Update conversation status for inbound messages
+async function updateInboundConversationStatus(locationId, conversationId) {
+  try {
+    // Ensure we have a valid token
+    await refreshTokenIfNeeded(locationId);
+    
+    // Use the conversation update endpoint
+    const url = `${GHL_API_URL}/conversations/${conversationId}`;
+    const payload = {
+      locationId,
+      // For inbound messages, make sure conversation appears in inbox with unread count
+      inbox: true,
+      unreadCount: 1
+    };
+    
+    // Prepare headers
+    const headers = {
+      Authorization: `Bearer ${tokens[locationId]?.access_token || process.env.GHL_PRIVATE_TOKEN}`,
+      Version: GHL_API_VERSION,
+      "Content-Type": "application/json",
+      locationId
+    };
+    
+    // Log pre-API call
+    console.log(`[${new Date().toISOString()}] Updating inbound conversation status in GHL`);
+    console.log(`URL: ${url}`);
+    console.log(`Headers: ${JSON.stringify({ ...headers, Authorization: "***MASKED***" })}`);
+    console.log(`Payload: ${JSON.stringify(payload)}`);
+    
+    // Make the API call
+    const response = await axios.put(url, payload, { headers });
+    
+    // Log post-API call
+    console.log(`[${new Date().toISOString()}] GHL inbound conversation update response: ${response.status}`);
+    console.log(`Response data: ${JSON.stringify(response.data)}`);
+    
+    return response;
+  } catch (err) {
+    console.error("GHL inbound conversation update error:", err.response?.data || err.message);
+    // Don't throw error here to prevent cascading failures
   }
 }
 
@@ -537,10 +795,14 @@ async function sendToGHLUsingPrivateToken(phone, message) {
     // Get contactId
     const contactId = await getContactIdByPhone(locationId, phone);
     
+    // Get or create conversation
+    const conversationId = await getOrCreateConversation(locationId, contactId);
+    
     // Now prepare the message API request
     const url = `${GHL_API_URL}/conversations/messages/inbound`;
     const payload = {
-      contactId: contactId,  // This is critical - must use contactId, not just contact object
+      contactId: contactId,
+      conversationId: conversationId,
       message: message,
       type: "SMS",  // Use uppercase SMS as per GHL API requirements
       direction: "inbound"
@@ -549,7 +811,7 @@ async function sendToGHLUsingPrivateToken(phone, message) {
     // Prepare headers
     const headers = {
       Authorization: `Bearer ${process.env.GHL_PRIVATE_TOKEN}`,
-      Version: "2021-07-28",
+      Version: GHL_API_VERSION,
       "Content-Type": "application/json"
     };
     
@@ -565,6 +827,9 @@ async function sendToGHLUsingPrivateToken(phone, message) {
     
     // Make the API call
     const response = await axios.post(url, payload, { headers });
+    
+    // Update the conversation status
+    await updateInboundConversationStatus(locationId, conversationId);
     
     // Log post-API call
     console.log(`[${new Date().toISOString()}] GHL inbound message response: ${response.status}`);
@@ -617,12 +882,30 @@ app.get("/test", async (req, res) => {
   try {
     const phone = req.query.phone || "+15555555555";
     const message = req.query.message || "Test message via BlueBubbles";
+    const locationId = req.query.locationId || process.env.GHL_DEFAULT_LOCATION_ID;
     
-    await sendToBlueBubbles(phone, message);
+    // First, send via BlueBubbles
+    const sendResult = await sendToBlueBubbles(phone, message);
+    
+    // If a locationId is provided, also log to GHL
+    let ghlResult = null;
+    if (locationId) {
+      try {
+        const contactId = await getContactIdByPhone(locationId, phone);
+        const conversationId = await getOrCreateConversation(locationId, contactId);
+        await logOutboundMessageToGHL(locationId, contactId, conversationId, message);
+        await updateConversationStatus(locationId, conversationId);
+        ghlResult = { success: true, conversationId };
+      } catch (ghlErr) {
+        ghlResult = { success: false, error: ghlErr.message };
+      }
+    }
     
     res.json({
-      success: true,
-      message: "Test message sent successfully!"
+      bluebubbles: sendResult.success ? 
+        { success: true, message: "Test message sent successfully!" } : 
+        { success: false, error: sendResult.error },
+      ghl: ghlResult
     });
   } catch (err) {
     console.error("Test failed:", err.message);
