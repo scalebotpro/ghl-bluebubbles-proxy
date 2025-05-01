@@ -186,11 +186,23 @@ app.post("/ghl-webhook", async (req, res) => {
       }
       
       // Forward outbound message to BlueBubbles
-      await sendToBlueBubbles(phone, message);
+      const sendResult = await sendToBlueBubbles(phone, message);
       
-      // Log the outbound message back to GHL
+      // Log the message to GHL regardless of BlueBubbles success
+      // This ensures the conversation history is maintained even if BlueBubbles is down
       if (contactId) {
-        await logOutboundMessageToGHL(locationId, contactId, conversationId, message);
+        try {
+          await logOutboundMessageToGHL(locationId, contactId, conversationId, message);
+          
+          // Add a note to the conversation if BlueBubbles failed
+          if (sendResult && !sendResult.success) {
+            // Add a system note that delivery failed
+            const noteMessage = `[System Note: Message delivery to BlueBubbles failed. Reason: ${sendResult.error}]`;
+            await logOutboundMessageToGHL(locationId, contactId, conversationId, noteMessage);
+          }
+        } catch (logError) {
+          console.error("Failed to log outbound message to GHL:", logError.message);
+        }
       } else {
         console.error("No contactId provided in webhook, cannot log outbound message");
       }
@@ -312,14 +324,45 @@ app.post("/outbound", async (req, res) => {
     }
     
     // Send via BlueBubbles
-    await sendToBlueBubbles(to, message);
+    const sendResult = await sendToBlueBubbles(to, message);
     
-    // Log to GHL if contactId is provided
-    if (contactId && locationId) {
-      await logOutboundMessageToGHL(locationId, contactId, null, message);
+    // If contactId is not provided but we have a phone number and locationId,
+    // try to find or create the contact
+    if (!contactId && locationId) {
+      try {
+        contactId = await getContactIdByPhone(locationId, to);
+        console.log(`Retrieved/created contactId ${contactId} for phone ${to}`);
+      } catch (lookupErr) {
+        console.error("Failed to lookup/create contact:", lookupErr.message);
+      }
     }
     
-    res.status(200).json({ status: "sent" });
+    // Log to GHL if contactId is available
+    if (contactId && locationId) {
+      try {
+        await logOutboundMessageToGHL(locationId, contactId, null, message);
+        
+        // Add a note to the conversation if BlueBubbles failed
+        if (sendResult && !sendResult.success) {
+          // Add a system note that delivery failed
+          const noteMessage = `[System Note: Message delivery to BlueBubbles failed. Reason: ${sendResult.error}]`;
+          await logOutboundMessageToGHL(locationId, contactId, null, noteMessage);
+        }
+      } catch (logError) {
+        console.error("Failed to log outbound message to GHL:", logError.message);
+      }
+    }
+    
+    // Return appropriate response based on BlueBubbles result
+    if (sendResult && !sendResult.success) {
+      return res.status(207).json({  // 207 Multi-Status
+        message_delivery: { status: "failed", error: sendResult.error },
+        ghl_logging: contactId ? "success" : "skipped",
+        details: "Message was logged to GHL, but delivery to BlueBubbles failed"
+      });
+    }
+    
+    res.status(200).json({ status: "sent", ghl_logging: contactId ? "success" : "skipped" });
   } catch (err) {
     console.error("Manual outbound error:", err.message);
     res.status(500).json({ error: "Failed to send message", details: err.message });
@@ -345,16 +388,51 @@ async function sendToBlueBubbles(to, message) {
   console.log(`Sending to BlueBubbles: ${to.substring(0, 6)}... (${message.substring(0, 30)}${message.length > 30 ? '...' : ''})`);
   
   try {
+    // Set a longer timeout for BlueBubbles requests (30 seconds)
     const response = await axios.post(
       process.env.BLUEBUBBLES_URL,
-      payload
+      payload,
+      { 
+        timeout: 30000,  // 30 second timeout
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
     );
     
     console.log("BlueBubbles response:", response.status);
     return response;
   } catch (err) {
-    console.error("BlueBubbles send error:", err.response?.data || err.message);
-    throw err;
+    // Check if it's a timeout error
+    if (err.code === 'ECONNABORTED' || (err.response && err.response.status === 524)) {
+      console.error("BlueBubbles timeout error. The server might be overloaded or temporarily unavailable.");
+      // We'll log the error but not throw, allowing the flow to continue
+      return {
+        status: 'timeout',
+        success: false,
+        error: 'Timeout connecting to BlueBubbles server'
+      };
+    }
+    
+    // For CloudFlare errors
+    if (err.message && err.message.includes('524')) {
+      console.error("CloudFlare timeout error (524) connecting to BlueBubbles server");
+      return {
+        status: 'cloudflare_timeout',
+        success: false,
+        error: 'CloudFlare timeout connecting to BlueBubbles server'
+      };
+    }
+    
+    console.error("BlueBubbles send error:", 
+      err.response?.data ? JSON.stringify(err.response.data).substring(0, 200) + '...' : err.message);
+    
+    // Return error object instead of throwing
+    return {
+      status: 'error',
+      success: false,
+      error: err.message
+    };
   }
 }
 
@@ -415,7 +493,7 @@ async function sendToGHL(locationId, phone, message) {
     // Now prepare the message API request
     const url = `${GHL_API_URL}/conversations/messages/inbound`;
     const payload = {
-      contactId: contactId,
+      contactId: contactId,  // This is critical - must use contactId, not just contact object
       message: message,
       type: "SMS",  // Use uppercase SMS as per GHL API requirements
       direction: "inbound"
@@ -462,7 +540,7 @@ async function sendToGHLUsingPrivateToken(phone, message) {
     // Now prepare the message API request
     const url = `${GHL_API_URL}/conversations/messages/inbound`;
     const payload = {
-      contactId: contactId,
+      contactId: contactId,  // This is critical - must use contactId, not just contact object
       message: message,
       type: "SMS",  // Use uppercase SMS as per GHL API requirements
       direction: "inbound"
