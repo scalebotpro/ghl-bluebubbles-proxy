@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ghl-bluebubbles-proxy
+    env: node
+    plan: free
+    branch: main
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: GHL_PRIVATE_TOKEN
+        sync: false
+      - key: BLUEBUBBLES_URL
+        sync: false
+
