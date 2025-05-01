@@ -44,15 +44,18 @@ app.post("/outbound", async (req, res) => {
     
     console.log(`Sending message to ${to}: ${message.substring(0, 30)}${message.length > 30 ? '...' : ''}`);
     
-    // Prepare the BlueBubbles request exactly as needed
+    // Generate a unique temp GUID as required by BlueBubbles
+    const tempGuid = `temp-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    
+    // Prepare the BlueBubbles request exactly as needed - with tempGuid
     const blueBubblesPayload = {
       chatGuid: to,
       message: message,
       method: "apple-script",
-      tempGuid: `temp-${Date.now()}`  // Add a temporary GUID
+      tempGuid: tempGuid  // Add the required tempGuid
     };
     
-    console.log("BlueBubbles payload:", blueBubblesPayload);
+    console.log("BlueBubbles payload:", JSON.stringify(blueBubblesPayload));
     
     const response = await axios.post(
       process.env.BLUEBUBBLES_URL, 
@@ -66,9 +69,8 @@ app.post("/outbound", async (req, res) => {
     
     // Add more detailed error logging
     if (err.response) {
-      console.error("Response data:", err.response.data);
+      console.error("Response data:", JSON.stringify(err.response.data));
       console.error("Response status:", err.response.status);
-      console.error("Response headers:", err.response.headers);
     }
     
     res.status(500).json({ error: "Failed to send message", details: err.message });
@@ -120,7 +122,7 @@ app.post("/inbound", async (req, res) => {
   }
 });
 
-// BlueBubbles API test with various formats
+// BlueBubbles API test with corrected format (including tempGuid)
 app.get("/test-api", async (req, res) => {
   try {
     const phone = req.query.phone || "+15555555555"; // Default test number
@@ -128,67 +130,47 @@ app.get("/test-api", async (req, res) => {
     
     console.log(`Testing API with phone=${phone}, message=${message}`);
     
-    // Format 1: Standard format
-    const payload1 = {
+    // Generate a unique temp GUID as required by BlueBubbles
+    const tempGuid = `temp-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    
+    // Format with tempGuid - this is what BlueBubbles requires
+    const payload = {
       chatGuid: phone,
       message: message,
-      method: "apple-script"
+      method: "apple-script",
+      tempGuid: tempGuid
     };
     
-    console.log("Trying format 1:", payload1);
-    let result = { formats: {} };
+    console.log("Sending payload:", JSON.stringify(payload));
     
     try {
-      const response1 = await axios.post(
+      const response = await axios.post(
         process.env.BLUEBUBBLES_URL,
-        payload1
+        payload
       );
-      result.formats.format1 = {
+      
+      return res.json({
         success: true,
-        status: response1.status,
-        data: response1.data
-      };
+        status: response.status,
+        data: response.data,
+        message: "Test message sent successfully!",
+        payload_used: payload
+      });
     } catch (err) {
-      result.formats.format1 = {
+      console.error("API test failed:", err.message);
+      
+      if (err.response) {
+        console.error("Response data:", JSON.stringify(err.response.data));
+      }
+      
+      return res.status(500).json({
         success: false,
         error: err.message,
         status: err.response?.status,
-        data: err.response?.data
-      };
+        data: err.response?.data,
+        payload_used: payload
+      });
     }
-    
-    // Format 2: Using guid instead of chatGuid
-    const payload2 = {
-      guid: phone,
-      message: message,
-      method: "apple-script"
-    };
-    
-    console.log("Trying format 2:", payload2);
-    
-    try {
-      const response2 = await axios.post(
-        process.env.BLUEBUBBLES_URL,
-        payload2
-      );
-      result.formats.format2 = {
-        success: true,
-        status: response2.status,
-        data: response2.data
-      };
-    } catch (err) {
-      result.formats.format2 = {
-        success: false,
-        error: err.message,
-        status: err.response?.status,
-        data: err.response?.data
-      };
-    }
-    
-    res.json({
-      test_results: result,
-      bluebubbles_url: process.env.BLUEBUBBLES_URL.split('?')[0] // Hide password
-    });
   } catch (err) {
     console.error("API test failed:", err.message);
     res.status(500).json({ error: err.message });
