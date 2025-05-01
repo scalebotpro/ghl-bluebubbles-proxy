@@ -3,7 +3,6 @@ services:
     name: ghl-bluebubbles-proxy
     env: node
     plan: free
-    branch: main
     buildCommand: npm install
     startCommand: node index.js
     envVars:
@@ -11,4 +10,4 @@ services:
         sync: false
       - key: BLUEBUBBLES_URL
         sync: false
-
+    healthCheckPath: /
