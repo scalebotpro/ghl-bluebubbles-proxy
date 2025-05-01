@@ -1,7 +1,7 @@
 // BlueBubbles + GHL Integration - Complete Implementation
 // This implementation properly handles both inbound and outbound messages
 // with explicit GHL conversation logging and enhanced debugging
-// Updated with proper BlueBubbles webhook support
+// Updated with fixed updateInboundConversationStatus function
 
 require("dotenv").config();
 const express = require("express");
@@ -275,7 +275,7 @@ async function processInboundMessage(messageData) {
       console.log(`Found/created contact ID: ${contactId}`);
     } catch (err) {
       console.error("Failed to find/create contact:", err.response?.data || err.message);
-      return;
+      return { success: false, error: err.message };
     }
     
     // 2. Get or create a conversation for this contact
@@ -285,12 +285,12 @@ async function processInboundMessage(messageData) {
       console.log(`Found/created conversation ID: ${conversationId}`);
     } catch (err) {
       console.error("Failed to find/create conversation:", err.response?.data || err.message);
-      return;
+      return { success: false, error: err.message };
     }
     
     // 3. Log the inbound message to GHL
     try {
-      console.log("Logging inbound message to GHL with:", { 
+      console.log("About to log inbound message to GHL with:", { 
         locationId, contactId, conversationId, messageLength: message.length
       });
       
@@ -299,7 +299,7 @@ async function processInboundMessage(messageData) {
       
       // 4. Update conversation status with unread count for inbound messages
       await updateInboundConversationStatus(locationId, conversationId);
-      console.log(`GHL conversation status updated`);
+      console.log(`GHL conversation status updated for inbound message`);
       
       return { success: true, contactId, conversationId };
     } catch (err) {
@@ -390,7 +390,7 @@ app.post("/inbound", async (req, res) => {
     // Process the message
     const result = await processInboundMessage(data);
     
-    res.status(result.success ? l200 : 500).json({
+    res.status(result.success ? 200 : 500).json({
       status: result.success ? "success" : "error",
       message: result.success ? "Inbound message logged to GHL" : result.error,
       details: result.success ? {
@@ -813,6 +813,50 @@ async function logInboundMessageToGHL(locationId, contactId, conversationId, mes
   }
 }
 
+// Update conversation status in GHL for inbound messages - FIXED IMPLEMENTATION
+async function updateInboundConversationStatus(locationId, conversationId) {
+  try {
+    // Get token for this location
+    const token = getTokenForLocation(locationId);
+    
+    // Use the conversation update endpoint
+    const url = `${GHL_API_URL}/conversations/${conversationId}`;
+    const payload = {
+      locationId,
+      // For inbound messages, set unreadCount to 1 to mark as unread
+      // This is the documented approach to signal a new unread message state
+      unreadCount: 1
+    };
+    
+    // Prepare headers
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Version: GHL_API_VERSION,
+      "Content-Type": "application/json",
+      locationId
+    };
+    
+    // Log pre-API call
+    console.log(`[${new Date().toISOString()}] Updating inbound conversation status in GHL`);
+    console.log(`URL: ${url}`);
+    console.log(`Headers: ${JSON.stringify({ ...headers, Authorization: "***MASKED***" })}`);
+    console.log(`Payload: ${JSON.stringify(payload)}`);
+    
+    // Make the API call
+    const response = await axios.put(url, payload, { headers });
+    
+    // Log post-API call
+    console.log(`[${new Date().toISOString()}] GHL inbound conversation update response: ${response.status}`);
+    console.log(`Response data: ${JSON.stringify(response.data)}`);
+    
+    return response;
+  } catch (err) {
+    console.error("GHL inbound conversation update error:", err.response?.data || err.message);
+    // Re-throw the error to allow the caller to handle it
+    throw err;
+  }
+}
+
 // Log internal notes to GHL conversation
 async function logInternalNoteToGHL(locationId, contactId, conversationId, message) {
   try {
@@ -895,49 +939,6 @@ async function updateConversationStatus(locationId, conversationId) {
     return response;
   } catch (err) {
     console.error("GHL conversation update error:", err.response?.data || err.message);
-    // Don't throw error here to prevent cascading failures
-  }
-}
-
-// Update conversation status in GHL for inbound messages
-async function updateInboundConversationStatus(locationId, conversationId) {
-  try {
-    // Get token for this location
-    const token = getTokenForLocation(locationId);
-    
-    // Use the conversation update endpoint
-    const url = `${GHL_API_URL}/conversations/${conversationId}`;
-    const payload = {
-      locationId,
-      // For inbound messages, set unread count and ensure inbox visibility
-      inbox: true,
-      unreadCount: 1
-    };
-    
-    // Prepare headers
-    const headers = {
-      Authorization: `Bearer ${token}`,
-      Version: GHL_API_VERSION,
-      "Content-Type": "application/json",
-      locationId
-    };
-    
-    // Log pre-API call
-    console.log(`[${new Date().toISOString()}] Updating inbound conversation status in GHL`);
-    console.log(`URL: ${url}`);
-    console.log(`Headers: ${JSON.stringify({ ...headers, Authorization: "***MASKED***" })}`);
-    console.log(`Payload: ${JSON.stringify(payload)}`);
-    
-    // Make the API call
-    const response = await axios.put(url, payload, { headers });
-    
-    // Log post-API call
-    console.log(`[${new Date().toISOString()}] GHL inbound conversation update response: ${response.status}`);
-    console.log(`Response data: ${JSON.stringify(response.data)}`);
-    
-    return response;
-  } catch (err) {
-    console.error("GHL inbound conversation update error:", err.response?.data || err.message);
     // Don't throw error here to prevent cascading failures
   }
 }
@@ -1050,19 +1051,19 @@ app.get("/test", async (req, res) => {
 });
 
 // Test endpoint for inbound webhook simulation
-app.get("/test-webhook", (req, res) => {
-  // Create sample BlueBubbles webhook payload for a new message
-  const sampleWebhookPayload = {
+app.get("/test-inbound", (req, res) => {
+  // Create sample BlueBubbles payload
+  const testPayload = {
     type: "new-message",
     data: {
-      guid: "message-guid-" + Date.now(),
       text: req.query.message || "This is a test inbound message",
-      dateCreated: new Date().toISOString(),
       isFromMe: false,
       handle: {
         address: req.query.phone || "+15555555555"
       },
-      service: "iMessage"
+      service: "iMessage",
+      dateCreated: new Date().toISOString(),
+      guid: "test-guid-" + Date.now()
     }
   };
   
@@ -1087,7 +1088,7 @@ app.get("/test-webhook", (req, res) => {
         <p>Use the following curl command to test your webhook endpoint:</p>
         <pre>curl -X POST "${process.env.APP_URL}/webhook" \\
   -H "Content-Type: application/json" \\
-  -d '${JSON.stringify(sampleWebhookPayload, null, 2)}'</pre>
+  -d '${JSON.stringify(testPayload, null, 2)}'</pre>
       </div>
       
       <div class="card">
@@ -1114,7 +1115,7 @@ app.get("/test-webhook", (req, res) => {
       
       <div class="card">
         <h2>Payload JSON</h2>
-        <pre>${JSON.stringify(sampleWebhookPayload, null, 2)}</pre>
+        <pre>${JSON.stringify(testPayload, null, 2)}</pre>
       </div>
     </body>
     </html>
@@ -1150,7 +1151,7 @@ app.get("/debug", (req, res) => {
       inbound_debug: `${process.env.APP_URL}/inbound-debug`,
       outbound: `${process.env.APP_URL}/outbound`,
       test: `${process.env.APP_URL}/test`,
-      test_webhook: `${process.env.APP_URL}/test-webhook`
+      test_inbound: `${process.env.APP_URL}/test-inbound`
     },
     environment: {
       app_url: process.env.APP_URL,
